@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fetch/build the two Apptainer images used on the Nova cluster.
 #   1. Isaac Lab (includes Isaac Sim + its bundled ROS 2 libs) from NGC
-#   2. ROS 2 Humble + VLM/grounding deps for the reasoning node
+#   2. vLLM (serves the open-source VLM)
+#   3. ROS 2 Humble + grounding deps for the reasoning node
 #
 # Run from a CPU job (pulling/building on the login node may be killed):
 #   srun -p nova -c 8 --mem=32G -t 2:00:00 --pty scripts/slurm/build_containers.sh
@@ -23,6 +24,11 @@ mkdir -p "$SIF_DIR" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 if [[ ! -f $SIF_DIR/isaaclab.sif ]]; then
   echo ">> pulling $ISAACLAB_IMAGE (~20 GB)"
   apptainer pull "$SIF_DIR/isaaclab.sif" "$ISAACLAB_IMAGE"
+fi
+VLLM_IMAGE=${VLLM_IMAGE:-docker://vllm/vllm-openai:v0.11.0}   # Qwen3-VL needs vLLM >= 0.11
+if [[ ! -f $SIF_DIR/vllm.sif ]]; then
+  echo ">> pulling $VLLM_IMAGE (~10 GB)"
+  apptainer pull "$SIF_DIR/vllm.sif" "$VLLM_IMAGE"
 fi
 if [[ ! -f $SIF_DIR/ros2_reasoner.sif ]]; then
   echo ">> building ros2_reasoner.sif"

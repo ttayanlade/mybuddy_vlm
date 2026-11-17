@@ -12,20 +12,22 @@ task:
   loop_hz: 1.0                         # high-level reasoning tick (~1 Hz)
 
 # ---------------------------------------------------------------------------
-# Robot: one 6-DoF arm of the MyBuddy 280 (kinematically == myCobot 280).
+# Robot: the LEFT 6-DoF arm of the MyBuddy 280, extracted from the official
+# description (urdf/mybuddy/mybuddy.urdf) and stood upright on the table.
 # ---------------------------------------------------------------------------
 robot:
   urdf_single_arm: assets/urdf/mybuddy_left_arm.urdf   # produced by sim/extract_single_arm.py
   usd_out: assets/usd/mybuddy_left_arm.usd             # produced by sim/import_urdf.py
-  base_link: base                                      # root of the single-arm chain (after extraction)
-  ee_link: joint6_flange                               # wrist camera + tool attach here
+  base_link: base                                      # new root made by extract_single_arm.py
+  ee_link: link6_L                                     # flange link (wrist camera attaches here)
+  kinematics: urdf                                     # urdf (exact) | dh (myCobot 280 table below)
   joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-  # Home pose (rad): flange at (0.13, 0, 0.20) in base frame, tool pointing down,
-  # out of the eye-to-hand camera view of the clutter.
-  home: [0.509, 0.529, -1.900, -0.201, 0.0, 0.0]
-  # Soft limits (rad) — slightly inside the servo limits of the 280 series.
-  joint_lower: [-2.879, -2.356, -2.618, -2.531, -2.879, -3.054]
-  joint_upper: [ 2.879,  2.356,  2.618,  2.531,  2.879,  3.054]
+  # Home pose (rad): tool at (0.12, 0, 0.18) in base frame pointing down, above the
+  # base and clear of the clutter. Solved with mybuddy_vlm.kinematics (URDF chain).
+  home: [-0.430, -0.344, 1.205, 0.709, 0.0, 0.0]
+  # Soft limits (rad): URDF limits (+-2.8798, j6 +-3.0543) x 0.95.
+  joint_lower: [-2.736, -2.736, -2.736, -2.736, -2.736, -2.902]
+  joint_upper: [ 2.736,  2.736,  2.736,  2.736,  2.736,  2.902]
   max_joint_vel: 1.0                   # rad/s  (real servos ~ 160 deg/s; keep pushes gentle)
   payload_limit_kg: 0.25
   # Base pose in the world (sits on the table top).
@@ -40,8 +42,8 @@ robot:
     effort_limit: [1.5, 1.5, 1.2, 0.6, 0.6, 0.6]       # N·m  (approx. myCobot servo stall torque)
     velocity_limit: 2.8                                # rad/s
 
-  # Standard DH of myCobot 280 (Elephant Robotics docs). Used by the pure-numpy
-  # IK backend. Verify against the imported URDF with sim/verify_kinematics.py.
+  # Standard DH of the myCobot 280 — only used when kinematics: dh (e.g. if you swap in
+  # a myCobot 280). The MyBuddy arm has different link lengths; it uses the URDF.
   dh:                # [d, a, alpha, theta_offset]
     - [0.13122,  0.0,     1.5707963,  0.0]
     - [0.0,     -0.1104,  0.0,       -1.5707963]
@@ -49,10 +51,10 @@ robot:
     - [0.0634,   0.0,     1.5707963, -1.5707963]
     - [0.07505,  0.0,    -1.5707963,  1.5707963]
     - [0.0456,   0.0,     0.0,        0.0]
-  tool_offset_z: 0.0  # extra length along flange z if a pusher/finger is mounted
+  tool_offset_z: 0.0137  # flange face along link6_L z (from mesh); add pusher/finger length here
 
-  # Real hardware: servo_deg = sign * degrees(q - offset). Calibrate by commanding
-  # the home pose in sim and on the robot and comparing (see README).
+  # Real hardware: servo = sign * (q - offset). Identity is what Elephant's own
+  # MyBuddy driver uses with this URDF (reference/elephantrobotics/slider_control.py).
   real_joint_signs: [1, 1, 1, 1, 1, 1]
   real_joint_offsets_deg: [0, 0, 0, 0, 0, 0]
 
@@ -167,13 +169,29 @@ ros:
 
 # ---------------------------------------------------------------------------
 vlm:
-  provider: openai                     # openai | openai_compatible (local VILA via vLLM/NIM)
-  model: gpt-4o
-  base_url: null                       # e.g. http://localhost:8000/v1 for local VILA
-  api_key_env: OPENAI_API_KEY
+  # Default: open-source VLM served locally by vLLM (OpenAI-compatible API). No API key,
+  # images never leave the cluster. Start it with scripts/slurm/vlm_server.sbatch, or let
+  # sim_pipeline.sbatch co-locate it. Env overrides: VLM_BASE_URL, VLM_MODEL.
+  #
+  #   model                                   GPU mem  structured_output  notes
+  #   Qwen/Qwen3-VL-8B-Instruct  (default)    ~20 GB   json_schema        strong spatial grounding, fast
+  #   Qwen/Qwen3-VL-32B-Instruct              ~70 GB   json_schema        better reasoning; A100-80G/H100/H200
+  #   Qwen/Qwen2.5-VL-7B-Instruct             ~18 GB   json_schema        older, very widely tested in vLLM
+  #   Qwen/Qwen3-VL-8B-Thinking               ~20 GB   none               reasoning model (<think> ... then JSON)
+  #   nvidia/Cosmos-Reason1-7B                ~18 GB   none               NVIDIA physical-AI reasoning VLM
+  #   OpenGVLab/InternVL3-8B                  ~18 GB   json_schema
+  #   gpt-4o  (provider: openai)              API      json_schema        closed; needs OPENAI_API_KEY
+  #
+  # Reasoning models: set structured_output: none and max_tokens >= 2048; serve with
+  # vLLM --reasoning-parser (qwen3 / deepseek_r1) so the chain of thought is separated.
+  provider: openai_compatible          # openai_compatible (vLLM / NIM / Ollama) | openai
+  model: Qwen/Qwen3-VL-8B-Instruct
+  base_url: http://localhost:8000/v1
+  api_key_env: OPENAI_API_KEY          # ignored by a local vLLM
+  structured_output: json_schema       # json_schema | json_object | none
   temperature: 0.2
-  max_tokens: 300
-  timeout_s: 30
+  max_tokens: 400
+  timeout_s: 60
   max_retries: 2
   image_max_side: 640
 
@@ -199,12 +217,12 @@ primitives:
   # "base": push_left == -Y_base (as specified). "camera": left/right are taken
   # from the eye-to-hand image and projected onto the table plane.
   direction_frame: base
-  workspace:                           # reachable box in base frame (myCobot 280 reach ~0.28 m)
-    x: [0.08, 0.28]
+  workspace:                           # reachable box in base frame (MyBuddy arm, tool down)
+    x: [0.08, 0.27]
     y: [-0.22, 0.22]
-    z: [0.0, 0.25]
-    max_radius: 0.27
-    # Tool-down IK has a dead zone near the base axis (wrist offsets d4/d5):
-    # r < ~0.13 m is unreachable at z 0.01-0.10 m (measured); 0.145 adds margin.
-    min_radius: 0.145
+    z: [0.0, 0.18]
+    max_radius: 0.26                   # 0.28 m at table height, ~0.26 m at z=0.10 (measured)
+    # Small tool-down dead zone near the base on the shoulder-offset side (r < 0.13 m at
+    # -45 deg, z < 0.06 m). Measured with the URDF-chain IK; see README.
+    min_radius: 0.13
   ik_backend: dh                       # dh (numpy, built-in) | moveit (/compute_ik service)

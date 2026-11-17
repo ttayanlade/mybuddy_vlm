@@ -21,6 +21,11 @@ def load_config(path: str | os.PathLike | None = None) -> dict[str, Any]:
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
     cfg["_path"] = str(path)
+    # Let Slurm jobs point at whichever VLM server is running without editing the file.
+    for env, key in (("VLM_BASE_URL", "base_url"), ("VLM_MODEL", "model"), ("VLM_PROVIDER", "provider"),
+                     ("VLM_STRUCTURED_OUTPUT", "structured_output")):
+        if os.environ.get(env):
+            cfg["vlm"][key] = os.environ[env]
     return cfg
 
 

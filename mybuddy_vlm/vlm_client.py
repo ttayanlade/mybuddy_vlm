@@ -1,9 +1,10 @@
 """Step 2 — VLM spatial reasoner.
 
-Works with OpenAI GPT-4o or any OpenAI-compatible server (local VILA served by
-vLLM / NVIDIA NIM: set ``vlm.provider: openai_compatible`` and ``vlm.base_url``).
-The response is validated against a strict schema; on a malformed reply the
-validation error is fed back to the model and the call is retried.
+Default backend: an open-source VLM (Qwen3-VL, Qwen2.5-VL, InternVL3, Cosmos-Reason1,
+VILA, ...) behind vLLM's OpenAI-compatible server; GPT-4o works with the same code.
+Output is constrained by JSON-Schema structured outputs where the model allows it,
+then validated strictly; on a malformed reply the validation error is fed back to the
+model and the call is retried. Reasoning models' <think> blocks are stripped.
 """
 
 from __future__ import annotations
@@ -20,6 +21,22 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 PRIMITIVES = ("push_left", "push_right", "lift", "pull")
+
+# Reasoning models emit their chain of thought first; it is never part of the answer.
+# (Some chat templates drop the opening tag, so also strip from start-of-text to </think>.)
+THINK_RE = re.compile(r"(?:<think>.*?</think>|^.*?</think>)", re.S)
+
+# JSON Schema for vLLM / OpenAI structured outputs: the decoder cannot emit anything else.
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target_obstacle": {"type": "string", "minLength": 1},
+        "primitive_action": {"type": "string", "enum": list(PRIMITIVES)},
+        "reasoning": {"type": "string", "minLength": 1},
+    },
+    "required": ["target_obstacle", "primitive_action", "reasoning"],
+    "additionalProperties": False,
+}
 
 SYSTEM_PROMPT = (
     "You are the high-level spatial reasoner of a MyBuddy 280 robot arm "
@@ -57,9 +74,10 @@ class VLMResponseError(ValueError):
 
 
 def parse_decision(text: str) -> VLMDecision:
-    """Strictly validate the VLM's JSON. Tolerates ```json fences (common with
-    local models) but nothing else."""
-    s = text.strip()
+    """Strictly validate the VLM's JSON. Tolerates what open models add around it:
+    ```json fences, and a leading <think>...</think> block from reasoning models
+    (Qwen3-VL-Thinking, Cosmos-Reason1, ...). The JSON object itself is strict."""
+    s = THINK_RE.sub("", text).strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", s, re.S)
     if fence:
         s = fence.group(1)
@@ -131,13 +149,24 @@ class VLMClient:
         kwargs = dict(model=self.cfg["model"], messages=messages,
                       temperature=self.cfg.get("temperature", 0.2),
                       max_tokens=self.cfg.get("max_tokens", 300))
-        if self.cfg["provider"] == "openai":
-            kwargs["response_format"] = {"type": "json_object"}  # GPT-4o JSON mode
+        so = self.cfg.get("structured_output", "json_schema")
+        if so == "json_schema":
+            # GPT-4o and vLLM (guided decoding) both accept this: output is schema-valid by construction.
+            kwargs["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "mybuddy_decision", "schema": DECISION_SCHEMA, "strict": True}}
+        elif so == "json_object":
+            kwargs["response_format"] = {"type": "json_object"}
+        # so == "none": reasoning models think first; constraining decoding would suppress
+        # the <think> block, so rely on parse_decision() + retry instead.
 
         last_err = None
         for attempt in range(self.cfg.get("max_retries", 2) + 1):
             resp = self.client.chat.completions.create(**kwargs)
-            text = resp.choices[0].message.content or ""
+            msg = resp.choices[0].message
+            text = msg.content or ""
+            thought = getattr(msg, "reasoning_content", None)  # vLLM --reasoning-parser puts it here
+            if thought:
+                log.debug("VLM reasoning: %s", thought[:2000])
             try:
                 d = parse_decision(text)
                 log.info("VLM: %s on '%s' — %s", d.primitive_action, d.target_obstacle, d.reasoning)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that the numpy DH model (used for IK) matches the imported URDF/USD.
+"""Check that the numpy kinematics (used for IK) match the arm PhysX actually simulates.
 
   ./isaaclab.sh -p sim/verify_kinematics.py --headless
 
@@ -50,7 +50,7 @@ def main():
     jids, _ = robot.find_joints(r["joint_names"], preserve_order=True)
     base_id = robot.find_bodies(r["base_link"])[0][0]
     ee_id = robot.find_bodies(r["ee_link"])[0][0]
-    arm = ArmModel.from_cfg(r)
+    arm = ArmModel.from_cfg({**r, "tool_offset_z": 0.0})  # compare the ee_link frame itself
     rng = np.random.default_rng(0)
     errs = []
     for _ in range(args.n):

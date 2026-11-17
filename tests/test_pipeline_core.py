@@ -230,3 +230,107 @@ def test_workspace_dead_zone_respected(cfg):
         for st in lib.plan(action, make_grounded([0.18, -0.01, 0.01], top_z=0.015, extent=(0.08, 0.065))).steps:
             for w in st.waypoints:
                 assert ws.contains(w.pos), (action, w.label, w.pos)
+
+
+# ------------------------------------------------------- MyBuddy URDF / kinematics
+def test_extracted_urdf_is_physics_ready(cfg):
+    import xml.etree.ElementTree as ET
+    from mybuddy_vlm.config import project_path
+
+    path = project_path(cfg["robot"]["urdf_single_arm"])
+    root = ET.parse(path).getroot()
+    joints = {j.get("name"): j for j in root.findall("joint")}
+    assert [n for n in joints if joints[n].get("type") == "revolute"] == cfg["robot"]["joint_names"]
+    for n in cfg["robot"]["joint_names"]:
+        assert float(joints[n].find("limit").get("velocity")) > 0          # upstream had 0
+        assert float(joints[n].find("limit").get("effort")) < 10           # upstream had 1000
+    for link in root.findall("link"):
+        assert link.find("inertial") is not None, link.get("name")          # upstream had none
+        for mesh in link.iter("mesh"):
+            assert (path.parent / mesh.get("filename")).exists()           # relative, resolvable
+    j1 = joints["joint1"].find("origin")
+    assert j1.get("xyz").split()[:2] == ["0", "0"]                         # mounted upright
+
+
+def test_dh_conversion_matches_classic_dh(cfg):
+    """from_dh() must reproduce the textbook DH product exactly."""
+    from mybuddy_vlm.kinematics import dh_transform
+
+    dh = np.asarray(cfg["robot"]["dh"], float)
+    arm = ArmModel.from_dh(dh, -np.pi * np.ones(6), np.pi * np.ones(6))
+    rng = np.random.default_rng(3)
+    for _ in range(10):
+        q = rng.uniform(-2, 2, 6)
+        T = np.eye(4)
+        for (d, a, al, off), qi in zip(dh, q):
+            T = T @ dh_transform(d, a, al, qi + off)
+        assert np.allclose(arm.fk(q), T, atol=1e-10)
+
+
+def test_analytic_jacobian_matches_numeric(arm):
+    rng = np.random.default_rng(4)
+    for _ in range(5):
+        q = rng.uniform(arm.lower, arm.upper)
+        e, J, _ = arm._task(q, np.array([0.2, 0.0, 0.05]), np.array([0, 0, -1.0]))
+        assert np.allclose(J, arm._num_jac(q, np.array([0.2, 0.0, 0.05]), np.array([0, 0, -1.0]), e), atol=1e-5)
+
+
+def test_workspace_front_is_reachable(arm, cfg):
+    """Every point of the configured workspace front (where clutter lives) is solvable."""
+    for x in (0.14, 0.20, 0.25):
+        for y in (-0.10, 0.0, 0.10):
+            for z in (0.012, 0.05, 0.10):
+                if np.hypot(x, y) <= cfg["primitives"]["workspace"]["max_radius"]:
+                    arm.ik([x, y, z], cfg["robot"]["home"])
+
+
+# ------------------------------------------------------- open-source / reasoning VLMs
+def test_parse_strips_reasoning_model_think_block():
+    txt = ('<think>The towel is flat and blue; keys are likely beneath it. Lifting exposes the most area.'
+           '</think>\n{"target_obstacle": "blue towel", "primitive_action": "lift", "reasoning": "covers keys"}')
+    assert parse_decision(txt).primitive_action == "lift"
+    # some chat templates drop the opening tag
+    txt2 = 'thinking...</think>{"target_obstacle": "mug", "primitive_action": "push_right", "reasoning": "r"}'
+    assert parse_decision(txt2).target_obstacle == "mug"
+
+
+def test_schema_enum_matches_primitives():
+    from mybuddy_vlm.vlm_client import DECISION_SCHEMA, PRIMITIVES
+
+    assert DECISION_SCHEMA["properties"]["primitive_action"]["enum"] == list(PRIMITIVES)
+    assert set(DECISION_SCHEMA["required"]) == {"target_obstacle", "primitive_action", "reasoning"}
+
+
+def test_env_overrides_vlm_endpoint(monkeypatch):
+    monkeypatch.setenv("VLM_BASE_URL", "http://nova-gpu:8123/v1")
+    monkeypatch.setenv("VLM_MODEL", "nvidia/Cosmos-Reason1-7B")
+    c = load_config()
+    assert c["vlm"]["base_url"] == "http://nova-gpu:8123/v1" and c["vlm"]["model"] == "nvidia/Cosmos-Reason1-7B"
+
+
+def test_vlm_client_request_and_retry(cfg, monkeypatch):
+    """Request shape for vLLM structured outputs + retry on a malformed first reply (no server)."""
+    pytest.importorskip("openai")
+    from types import SimpleNamespace as NS
+    from mybuddy_vlm.vlm_client import VLMClient
+
+    replies = iter(["Sure! I would move the towel.",
+                    '{"target_obstacle": "blue towel", "primitive_action": "pull", "reasoning": "on top"}'])
+    calls = []
+
+    def fake_create(**kw):
+        calls.append(kw)
+        return NS(choices=[NS(message=NS(content=next(replies), reasoning_content=None))])
+
+    client = VLMClient(cfg["vlm"])
+    monkeypatch.setattr(client.client.chat.completions, "create", fake_create)
+    d = client.decide(np.zeros((48, 64, 3), np.uint8), "keys",
+                      history=[{"target_obstacle": "mug", "primitive_action": "push_left", "outcome": "executed"}])
+    assert d.primitive_action == "pull" and len(calls) == 2
+    first = calls[0]
+    assert first["model"] == cfg["vlm"]["model"]
+    assert first["response_format"]["type"] == "json_schema"
+    text = first["messages"][1]["content"][0]["text"]
+    assert "finding keys" in text and "push_left on 'mug'" in text
+    assert first["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert "Invalid response" in calls[1]["messages"][-1]["content"]   # error fed back on retry

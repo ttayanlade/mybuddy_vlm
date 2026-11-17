@@ -11,8 +11,11 @@ is unchanged between --sim and --real:
   python real/mybuddy_driver_node.py --port /dev/ttyACM0 --arm left
 
 MyBuddy ids in pymycobot: 1 = left arm, 2 = right arm, 3 = waist.
-Servo angles are degrees; if your URDF/DH zero or sign convention differs from
-the servo's, set robot.real_joint_signs / real_joint_offsets_deg in the config.
+Joint angles are streamed with send_radians(id, q, speed), exactly how Elephant's
+own MyBuddy slider_control.py drives the arm from the same URDF, so URDF joint
+angles == servo angles (real_joint_signs = 1, offsets = 0). Note our base frame is
+the upstream joint-1 frame yawed by 180 deg (--mount-yaw), which only affects the
+camera extrinsic you calibrate, not the joint angles.
 
 Safety: trajectories are streamed at <= ``--rate`` Hz with send_angles(); the
 servo's own speed limit (``--speed``, %) caps motion. Keep a hand on the e-stop
@@ -47,6 +50,9 @@ class MyBuddyDriver(Node):
         from pymycobot.mybuddy import MyBuddy
 
         self.mb = MyBuddy(port, baud)
+        time.sleep(0.05)
+        self.mb.set_fresh_mode(1)   # latest command wins (needed for streaming), as in Elephant's slider_control.py
+        time.sleep(0.05)
         self.arm_id = ARM_ID[arm]
         self.speed, self.period = speed, 1.0 / rate
         r = cfg["robot"]
@@ -69,7 +75,11 @@ class MyBuddyDriver(Node):
 
     # model <-> servo -------------------------------------------------------
     def to_servo_deg(self, q):
-        return list(np.degrees(self.signs * (np.asarray(q) - self.offs)).round(2))
+        return list(np.degrees(self.to_servo_rad(q)).round(2))
+
+    def to_servo_rad(self, q):
+        # Elephant's own driver sends URDF radians unchanged (signs=1, offsets=0)
+        return [float(x) for x in self.signs * (np.asarray(q) - self.offs)]
 
     def from_servo_deg(self, deg):
         return self.signs * np.radians(np.asarray(deg, float)) + self.offs
@@ -120,7 +130,7 @@ class MyBuddyDriver(Node):
                     a = np.clip((t - times[i - 1]) / max(times[i] - times[i - 1], 1e-6), 0, 1)
                     q = pos[i - 1] + a * (pos[i] - pos[i - 1])
                 with self.serial:
-                    self.mb.send_angles(self.arm_id, self.to_servo_deg(q), self.speed)
+                    self.mb.send_radians(self.arm_id, self.to_servo_rad(q), self.speed)
             time.sleep(max(0.0, self.period - (time.monotonic() - t_loop)))
 
     def stop(self):
