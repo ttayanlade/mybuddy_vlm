@@ -1,0 +1,210 @@
+# =============================================================================
+# MyBuddy single-arm VLM pipeline — single source of truth.
+# Read by: sim/mybuddy_env.py (Isaac Lab), mybuddy_vlm/* (reasoning node),
+#          real/mybuddy_driver_node.py (hardware driver).
+# Units: metres, radians, seconds, kilograms unless stated otherwise.
+# =============================================================================
+
+task:
+  target: "keys"                       # what we are searching for
+  target_detect_threshold: 0.40        # GroundingDINO box score => "found, stop"
+  max_iterations: 15
+  loop_hz: 1.0                         # high-level reasoning tick (~1 Hz)
+
+# ---------------------------------------------------------------------------
+# Robot: one 6-DoF arm of the MyBuddy 280 (kinematically == myCobot 280).
+# ---------------------------------------------------------------------------
+robot:
+  urdf_single_arm: assets/urdf/mybuddy_left_arm.urdf   # produced by sim/extract_single_arm.py
+  usd_out: assets/usd/mybuddy_left_arm.usd             # produced by sim/import_urdf.py
+  base_link: base                                      # root of the single-arm chain (after extraction)
+  ee_link: joint6_flange                               # wrist camera + tool attach here
+  joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+  # Home pose (rad): flange at (0.13, 0, 0.20) in base frame, tool pointing down,
+  # out of the eye-to-hand camera view of the clutter.
+  home: [0.509, 0.529, -1.900, -0.201, 0.0, 0.0]
+  # Soft limits (rad) — slightly inside the servo limits of the 280 series.
+  joint_lower: [-2.879, -2.356, -2.618, -2.531, -2.879, -3.054]
+  joint_upper: [ 2.879,  2.356,  2.618,  2.531,  2.879,  3.054]
+  max_joint_vel: 1.0                   # rad/s  (real servos ~ 160 deg/s; keep pushes gentle)
+  payload_limit_kg: 0.25
+  # Base pose in the world (sits on the table top).
+  base_pos_world: [0.0, 0.0, 0.75]
+  base_quat_world: [1.0, 0.0, 0.0, 0.0]  # (w, x, y, z)
+
+  # Compliant joint drives (PhysX implicit PD). Low stiffness + moderate damping
+  # lets the arm yield when pushing through clutter instead of fighting it.
+  drives:
+    stiffness: [40.0, 40.0, 30.0, 12.0, 8.0, 6.0]      # N·m/rad
+    damping:   [ 4.0,  4.0,  3.0,  1.2, 0.8, 0.6]      # N·m·s/rad
+    effort_limit: [1.5, 1.5, 1.2, 0.6, 0.6, 0.6]       # N·m  (approx. myCobot servo stall torque)
+    velocity_limit: 2.8                                # rad/s
+
+  # Standard DH of myCobot 280 (Elephant Robotics docs). Used by the pure-numpy
+  # IK backend. Verify against the imported URDF with sim/verify_kinematics.py.
+  dh:                # [d, a, alpha, theta_offset]
+    - [0.13122,  0.0,     1.5707963,  0.0]
+    - [0.0,     -0.1104,  0.0,       -1.5707963]
+    - [0.0,     -0.096,   0.0,        0.0]
+    - [0.0634,   0.0,     1.5707963, -1.5707963]
+    - [0.07505,  0.0,    -1.5707963,  1.5707963]
+    - [0.0456,   0.0,     0.0,        0.0]
+  tool_offset_z: 0.0  # extra length along flange z if a pusher/finger is mounted
+
+  # Real hardware: servo_deg = sign * degrees(q - offset). Calibrate by commanding
+  # the home pose in sim and on the robot and comparing (see README).
+  real_joint_signs: [1, 1, 1, 1, 1, 1]
+  real_joint_offsets_deg: [0, 0, 0, 0, 0, 0]
+
+  gripper:
+    enabled: false     # set true if your arm has the adaptive gripper modelled & mounted
+    joint_names: []    # e.g. [gripper_controller] for the myCobot adaptive gripper
+
+# ---------------------------------------------------------------------------
+# Cameras — Intel RealSense D435 colour stream @ 640x480.
+# Depth is ALIGNED to colour, so colour intrinsics are used for both.
+# Replace with `ros2 topic echo /camera/color/camera_info` from your unit.
+# ---------------------------------------------------------------------------
+camera:
+  width: 640
+  height: 480
+  fx: 615.0
+  fy: 615.0
+  cx: 320.0
+  cy: 240.0
+  focal_length_mm: 1.93
+  clipping_range: [0.1, 10.0]
+  depth_scale: 0.001                   # real D435 publishes uint16 mm; sim publishes float32 m
+  publish_hz: 15.0
+  # Sim depth noise to mimic D435 (sigma = k * z^2) and random dropout holes.
+  sim_depth_noise_k: 0.0025
+  sim_depth_dropout: 0.01
+
+scene:
+  table:
+    size: [0.9, 0.9, 0.75]             # x, y, height
+    pos: [0.25, 0.0, 0.375]            # centre of the table box
+  # Static eye-to-hand camera, ROS optical convention (z fwd, x right, y down),
+  # pose expressed in the WORLD frame. Looks at the workspace from the far side.
+  static_camera:
+    pos: [0.55, 0.0, 1.20]
+    # Pitched 55 deg down, facing -x toward the robot. (w, x, y, z)
+    quat_ros: [-0.2126, 0.6744, 0.6744, -0.2126]
+  # Eye-in-hand camera offset from ee_link (ROS optical convention).
+  wrist_camera:
+    pos: [0.0, -0.04, 0.02]
+    quat_ros: [1.0, 0.0, 0.0, 0.0]
+
+  # Clutter. Masses are DELIBERATELY tiny (0.03–0.1 kg): the real MyBuddy has
+  # ~250 g payload and weak servos; heavier props saturate the simulated torque
+  # limits and the VLM loop stalls. Positions are in the robot BASE frame.
+  objects:
+    mug:
+      kind: ycb
+      usd: Props/YCB/Axis_Aligned_Physics/025_mug.usd
+      scale: 0.8
+      pos: [0.20, 0.10, 0.05]
+      mass: 0.08
+    box:
+      kind: ycb
+      usd: Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd
+      scale: 0.5
+      pos: [0.22, -0.10, 0.06]
+      mass: 0.06
+    keys:                              # the hidden target (stand-in: small metal-grey block)
+      kind: cuboid
+      size: [0.05, 0.025, 0.008]
+      color: [0.75, 0.75, 0.70]
+      metallic: 0.9
+      pos: [0.18, -0.01, 0.006]
+      mass: 0.03
+    towel:                             # semi-rigid FEM soft body draped over the keys
+      kind: towel
+      size: [0.16, 0.13, 0.008]
+      color: [0.15, 0.35, 0.75]
+      pos: [0.18, -0.01, 0.03]
+      mass: 0.03
+      youngs_modulus: 2.0e4
+      poissons_ratio: 0.3
+      mode: deformable                 # deformable (needs GPU physics) | rigid_thin (fallback)
+
+  randomize:
+    enabled: true
+    object_xy_jitter: 0.015
+    light_intensity: [1500.0, 4000.0]
+    light_color_temp_jitter: 0.15
+
+# ---------------------------------------------------------------------------
+# ROS 2 — --sim / --real ONLY change the namespace and clock source.
+# Every topic below is RELATIVE and resolved under the profile namespace.
+# ---------------------------------------------------------------------------
+ros:
+  topics:
+    color: camera/color/image_raw
+    depth: camera/depth/image_rect_raw  # real: remap to aligned depth (see README)
+    camera_info: camera/color/camera_info
+    wrist_color: wrist_camera/color/image_raw
+    wrist_depth: wrist_camera/depth/image_rect_raw
+    joint_states: mybuddy/joint_states
+    joint_cmd: mybuddy/joint_trajectory_controller/joint_cmd
+    gripper_cmd: mybuddy/gripper_cmd
+    status: mybuddy/vlm_status
+  profiles:
+    sim:
+      namespace: /sim
+      use_sim_time: true
+    real:
+      namespace: ""
+      use_sim_time: false
+
+  # Camera -> robot base extrinsic. "from_scene" derives it from scene.static_camera
+  # and robot.base_*_world (exact in sim). For real, paste your hand-eye calibration.
+  extrinsics:
+    sim: from_scene
+    real:
+      pos: [0.55, 0.0, 0.45]
+      quat_ros: [-0.2126, 0.6744, 0.6744, -0.2126]
+
+# ---------------------------------------------------------------------------
+vlm:
+  provider: openai                     # openai | openai_compatible (local VILA via vLLM/NIM)
+  model: gpt-4o
+  base_url: null                       # e.g. http://localhost:8000/v1 for local VILA
+  api_key_env: OPENAI_API_KEY
+  temperature: 0.2
+  max_tokens: 300
+  timeout_s: 30
+  max_retries: 2
+  image_max_side: 640
+
+grounding:
+  detector: IDEA-Research/grounding-dino-base     # HF transformers id
+  segmenter: facebook/sam2.1-hiera-large          # sam2 package / HF id
+  box_threshold: 0.30
+  text_threshold: 0.25
+  device: cuda
+  depth_window_px: 7                   # median-depth window around mask centre
+
+primitives:
+  approach_height: 0.08                # above the object top before descending
+  contact_drop: 0.015                  # "lower slightly" below the object top
+  min_z: 0.012                         # never go below this (base frame, table = 0)
+  standoff: 0.03                       # clearance from object edge before a push
+  push_distance: 0.10
+  pull_distance: 0.08
+  lift_height: 0.10
+  cart_speed: 0.05                     # m/s Cartesian speed during contact
+  free_speed: 0.12                     # m/s in free space
+  waypoint_spacing: 0.01               # Cartesian interpolation resolution
+  # "base": push_left == -Y_base (as specified). "camera": left/right are taken
+  # from the eye-to-hand image and projected onto the table plane.
+  direction_frame: base
+  workspace:                           # reachable box in base frame (myCobot 280 reach ~0.28 m)
+    x: [0.08, 0.28]
+    y: [-0.22, 0.22]
+    z: [0.0, 0.25]
+    max_radius: 0.27
+    # Tool-down IK has a dead zone near the base axis (wrist offsets d4/d5):
+    # r < ~0.13 m is unreachable at z 0.01-0.10 m (measured); 0.145 adds margin.
+    min_radius: 0.145
+  ik_backend: dh                       # dh (numpy, built-in) | moveit (/compute_ik service)

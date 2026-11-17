@@ -1,0 +1,23 @@
+Bootstrap: docker
+From: ros:humble-ros-base-jammy
+
+# ROS 2 Humble (py3.10) + VLM / Grounding DINO / SAM 2 deps for the reasoning node.
+# Build (CPU node is fine, ~15 min):
+#   apptainer build containers/ros2_reasoner.sif containers/ros2_reasoner.def
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip git ros-humble-topic-tools ros-humble-rmw-fastrtps-cpp \
+        && rm -rf /var/lib/apt/lists/*
+    pip3 install --no-cache-dir --upgrade pip
+    pip3 install --no-cache-dir torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+    pip3 install --no-cache-dir "numpy<2" pyyaml pillow "openai>=1.40" "transformers>=4.45,<5" pytest
+    SAM2_BUILD_CUDA=0 pip3 install --no-cache-dir "git+https://github.com/facebookresearch/sam2.git"
+
+%environment
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    source /opt/ros/humble/setup.bash
+
+%runscript
+    exec "$@"

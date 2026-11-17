@@ -1,0 +1,18 @@
+[project]
+name = "mybuddy_vlm"
+version = "0.1.0"
+description = "Zero-shot VLM reasoning + grounding + motion primitives for a single MyBuddy 280 arm"
+requires-python = ">=3.9"
+dependencies = ["numpy", "pyyaml", "pillow"]
+
+[project.optional-dependencies]
+vlm = ["openai>=1.40"]
+grounding = ["torch", "transformers>=4.45", "sam2"]
+real = ["pymycobot"]
+
+[tool.setuptools]
+packages = ["mybuddy_vlm"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
