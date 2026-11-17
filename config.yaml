@@ -1,0 +1,92 @@
+# MyBuddy "Find the Fruit" with a VLM instead of RL.
+# Scene, robot, camera, drives and success metric copied from Find the Fruit
+# (Subedi et al. 2025, arXiv:2505.16547); decision-making is a VLM + IK primitive.
+# Units: metres, radians, seconds. Frames: "base" == the env frame (robot at origin).
+
+robot:
+  usd: assets/ftf/mybuddy_rotate.usd
+  # Controlled joints exactly as in Find the Fruit: waist + left arm j1..j5 (j6 not used).
+  joints: [bc2bl, left_arm_j1, left_arm_j2, left_arm_j3, left_arm_j4, left_arm_j5]
+  fixed_tail: {left_arm_j6: 0.0}          # held at this angle, folded into the tool transform
+  ee_body: left_arm_l6
+  tool_offset: [0.0, 0.0, 0.0]            # contact point in the left_arm_l6 frame
+  init_deg: [0, -90, 0, 120, -120, 180]   # their root_init_angles
+  # Their reset randomises left_arm_j2 (index 2): 50% in [-0.52,-0.17], 50% in [0.2,0.3] rad.
+  init_j2_ranges: [[-0.52, -0.17], [0.2, 0.3]]
+  lower: [-1.0, -3.1, -3.1, -3.1, -3.1, -3.1]   # waist clamp (-1.0, 0.7) as in their env
+  upper: [ 0.7,  3.1,  3.1,  3.1,  3.1,  3.1]
+  # Their drives: stiff position control, robot weightless. Compliance belongs to the real
+  # servos' low-level controller, not to the sim ("decouple kinematic planning from control").
+  stiffness: 800.0
+  damping: 4.0
+  effort_limit: 1000.0
+  velocity_limit: 10.0
+  max_joint_vel: 1.5                      # rad/s used when timing our trajectories
+  # Their env enables self-collisions and counts any arm-link contact as failure. PhysX collides
+  # these bodies as convex hulls of their meshes; IK checks the same hulls and uses the arm's
+  # redundancy (null space) to keep `influence` away, never accepting less than `margin`.
+  # Confirmed in sim (run 1117-150933): all contacts were left_arm_l3 vs base_link (torso+head hull).
+  self_collision:
+    obstacles: [base_link, right_arm_l1, right_arm_l2, right_arm_l3, right_arm_l4, right_arm_l5, right_arm_l6]
+    links: [left_arm_l2, left_arm_l3, left_arm_l4, left_arm_l5, left_arm_l6]
+    margin: 0.01                          # every IK solution keeps at least this
+    path_margin: 0.003                    # free joint-space moves between solutions (contact is at 0)
+    influence: 0.025
+
+scene:
+  plant_usd: assets/ftf/plant_v21.usd
+  background_usd: assets/ftf/background.usd
+  plant_pos: [0.06, -0.25, 0.0]
+  plant_scale: 0.05
+  num_fruits: 2
+  fruit_radius: 0.03
+  fruit_base_pos: [0.0, -0.4, 0.28]
+  fruit_x_jitter: [0.0, 0.15]             # each fruit: x += U(0, 0.15) at reset
+
+camera:                                    # their camera (pose + optics), "opengl" offset convention
+  pos: [0.0, 0.0, 0.5]
+  rot_opengl: [0.0, 0.0, 0.53833, 0.84274]
+  focal_length: 4.0
+  focus_distance: 0.6
+  horizontal_aperture: 5.760000228881836
+  vertical_aperture: 3.5999999046325684
+  clipping_range: [0.076, 10.0]
+  metric_res: 256                          # their 256x256 camera: used ONLY for the success metric
+  vlm_res: 768                             # same pose/optics, higher resolution for the VLM
+
+metric:                                    # their reward terms, used here purely as evaluation
+  mask_size: 30                            # target mask = 30x30 px box at the projected fruit centre
+  plant_depth_band: [0.1, 0.4]             # depth band that counts as "plant"
+  visible_px: 160                          # success if occluded pixels <= 160 ...
+  sustain_steps: 10                        # ... for 10 consecutive control steps
+  contact_is_failure: true                 # rigid contact on an arm link ends the episode
+
+sim:
+  dt: 0.016666666666666666                 # 1/60, decimation 2 -> 30 Hz control (theirs)
+  decimation: 2
+  settle_s: 1.5                            # let the plant settle after reset
+
+agent:
+  max_actions: 5                           # VLM decisions per episode
+  point_snap_px: 30                        # snap the VLM point to the nearest plant pixel within this
+  # sweep primitive (base frame): start behind the point, push through it, retreat
+  pre_dist: 0.04
+  push_dist: 0.10
+  approach_back: 0.08                      # waypoints pulled back toward the camera/robot
+  cart_speed: 0.08
+  free_speed: 0.20
+  waypoint_spacing: 0.01
+  min_z: 0.03
+  fruit_clearance: 0.02                    # keep the tool this far from any fruit surface
+
+vlm:
+  # Open-source VLM behind vLLM's OpenAI-compatible API (env overrides: VLM_BASE_URL, VLM_MODEL).
+  base_url: http://127.0.0.1:8000/v1
+  model: Qwen/Qwen3-VL-8B-Instruct
+  api_key_env: OPENAI_API_KEY              # ignored by vLLM; set for GPT-4o
+  structured_output: json_schema           # json_schema | none (reasoning models)
+  point_format: norm1000                   # Qwen3-VL points in [0,1000]; use "pixels" for Qwen2.5-VL
+  temperature: 0.2
+  max_tokens: 400
+  timeout_s: 120
+  max_retries: 2

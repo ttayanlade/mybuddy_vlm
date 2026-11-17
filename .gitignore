@@ -1,11 +1,12 @@
+# environments, caches, outputs
 .venv/
 __pycache__/
-runs/
-assets/usd/
 *.pyc
-.apptainer_cache/
-.apptainer_tmp/
-.isaac_home/
-.hf_cache/
-containers/*.sif
 .pytest_cache/
+.hf_cache/
+.isaac_home/
+.isaac_cache/
+.apptainer_*/
+containers/*.sif
+runs/
+archive/

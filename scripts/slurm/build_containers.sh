@@ -1,38 +1,47 @@
 #!/usr/bin/env bash
-# Fetch/build the two Apptainer images used on the Nova cluster.
-#   1. Isaac Lab (includes Isaac Sim + its bundled ROS 2 libs) from NGC
-#   2. vLLM (serves the open-source VLM)
-#   3. ROS 2 Humble + grounding deps for the reasoning node
+#SBATCH --job-name=mybuddy-build
+#SBATCH --partition=nova
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=04:00:00
+#SBATCH --output=runs/build-%j.out
 #
-# Run from a CPU job (pulling/building on the login node may be killed):
-#   srun -p nova -c 8 --mem=32G -t 2:00:00 --pty scripts/slurm/build_containers.sh
+# Fetch/build the Apptainer images used on the Nova cluster. Pass the ones you want
+# (default: all), e.g.
+#   sbatch scripts/slurm/build_containers.sh isaaclab        # only what assets/render/scene-sim need
+#   sbatch scripts/slurm/build_containers.sh vllm
+#
+#   isaaclab  Isaac Lab 2.3.2 / Isaac Sim 5.1 (+ bundled ROS 2 libs) from NGC   ~25 GB
+#   vllm      vLLM OpenAI-compatible server for the open-source VLM              ~10 GB
 #
 # Isaac Sim needs glibc >= 2.35 for the pip wheels; RHEL9 has 2.34, hence containers.
-# NGC may require a (free) API key:
+# Public NGC images pull anonymously; if NGC asks for auth:
 #   export APPTAINER_DOCKER_USERNAME='$oauthtoken' APPTAINER_DOCKER_PASSWORD=<NGC key>
 set -euo pipefail
-cd "$(dirname "$0")/../.."
-PROJ=$(pwd)
+PROJ=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}
+cd "$PROJ"
+mkdir -p runs
 module load apptainer
 
 SIF_DIR=${SIF_DIR:-$PROJ/containers}
-ISAACLAB_IMAGE=${ISAACLAB_IMAGE:-docker://nvcr.io/nvidia/isaac-lab:2.1.0}   # check NGC for newer tags
-export APPTAINER_CACHEDIR=${APPTAINER_CACHEDIR:-$PROJ/.apptainer_cache}
-export APPTAINER_TMPDIR=${APPTAINER_TMPDIR:-$PROJ/.apptainer_tmp}
+ISAACLAB_IMAGE=${ISAACLAB_IMAGE:-docker://nvcr.io/nvidia/isaac-lab:2.3.2}   # newest 2.x on NGC (3.0 changes APIs)
+VLLM_IMAGE=${VLLM_IMAGE:-docker://vllm/vllm-openai:v0.11.0}                 # Qwen3-VL needs vLLM >= 0.11
+# Always use project-local dirs: Nova presets APPTAINER_TMPDIR=/tmp, which is small and shared.
+export APPTAINER_CACHEDIR=${BUILD_CACHEDIR:-$PROJ/.apptainer_cache}
+export APPTAINER_TMPDIR=${BUILD_TMPDIR:-$PROJ/.apptainer_tmp/${SLURM_JOB_ID:-$$}}
 mkdir -p "$SIF_DIR" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+WANT=("$@"); [[ ${#WANT[@]} -eq 0 ]] && WANT=(isaaclab vllm)
 
-if [[ ! -f $SIF_DIR/isaaclab.sif ]]; then
-  echo ">> pulling $ISAACLAB_IMAGE (~20 GB)"
-  apptainer pull "$SIF_DIR/isaaclab.sif" "$ISAACLAB_IMAGE"
-fi
-VLLM_IMAGE=${VLLM_IMAGE:-docker://vllm/vllm-openai:v0.11.0}   # Qwen3-VL needs vLLM >= 0.11
-if [[ ! -f $SIF_DIR/vllm.sif ]]; then
-  echo ">> pulling $VLLM_IMAGE (~10 GB)"
-  apptainer pull "$SIF_DIR/vllm.sif" "$VLLM_IMAGE"
-fi
-if [[ ! -f $SIF_DIR/ros2_reasoner.sif ]]; then
-  echo ">> building ros2_reasoner.sif"
-  apptainer build --fakeroot "$SIF_DIR/ros2_reasoner.sif" containers/ros2_reasoner.def
-fi
-rm -rf "$APPTAINER_TMPDIR"
+for w in "${WANT[@]}"; do
+  t0=$SECONDS
+  case "$w" in
+    isaaclab) [[ -f $SIF_DIR/isaaclab.sif ]] || apptainer pull "$SIF_DIR/isaaclab.sif" "$ISAACLAB_IMAGE" ;;
+    vllm)     [[ -f $SIF_DIR/vllm.sif ]]     || apptainer pull "$SIF_DIR/vllm.sif" "$VLLM_IMAGE" ;;
+    *) echo "unknown image '$w'"; exit 1 ;;
+  esac
+  echo ">> $w done in $(( SECONDS - t0 ))s"
+done
+# only ever delete the per-job temp dir we created inside the project
+[[ $APPTAINER_TMPDIR == "$PROJ"/.apptainer_tmp/* ]] && rm -rf "$APPTAINER_TMPDIR"
 ls -lh "$SIF_DIR"/*.sif
+df -h "$PROJ" | tail -1

@@ -1,14 +1,9 @@
 [project]
 name = "mybuddy_vlm"
-version = "0.1.0"
-description = "Zero-shot VLM reasoning + grounding + motion primitives for a single MyBuddy 280 arm"
+version = "0.2.0"
+description = "Find the Fruit (MyBuddy, Isaac Lab) solved zero-shot with a VLM instead of RL"
 requires-python = ">=3.9"
-dependencies = ["numpy", "pyyaml", "pillow"]
-
-[project.optional-dependencies]
-vlm = ["openai>=1.40"]
-grounding = ["torch", "transformers>=4.45", "sam2"]
-real = ["pymycobot"]
+dependencies = ["numpy", "scipy", "pyyaml", "pillow", "usd-core"]
 
 [tool.setuptools]
 packages = ["mybuddy_vlm"]

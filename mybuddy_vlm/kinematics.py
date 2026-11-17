@@ -1,15 +1,14 @@
-"""MyBuddy 280 single-arm kinematics — pure numpy.
+"""MyBuddy left-arm kinematics read straight from the robot USD (pure numpy + pxr).
 
-* Forward kinematics straight from the URDF joint chain (default: the MyBuddy
-  arm's link lengths differ from the myCobot 280's), or from a DH table.
-* Damped-least-squares IK for a 5-D task: tool position (3) + tool z-axis
-  pointing straight down (2). Yaw about the tool axis is left free, which is
-  what pushing primitives need and maximises reachability on a 6-DoF arm with
-  a 28 cm reach.
-* Joint-space trajectory construction from Cartesian waypoints with
-  continuity checks and velocity-limited time parameterisation.
+Each USD physics joint stores the joint frame in its parent body (localPos0/localRot0)
+and in its child body (localPos1/localRot1) plus an axis, so the child pose is
 
-An optional MoveIt 2 backend (``ik_backend: moveit``) lives in ros_interface.py.
+    T_parent_child(q) = T(lp0, lr0) @ Rot(axis, q) @ inv(T(lp1, lr1))
+
+Chaining these from the world-fixed root gives exact FK for the same model PhysX
+simulates. IK is position-only (the contact point matters, not the wrist angle, and
+the 6 controlled joints include the waist): damped least squares with an analytic
+Jacobian, warm-started from the previous solution and a bank of random seeds.
 """
 
 from __future__ import annotations
@@ -19,23 +18,8 @@ from dataclasses import dataclass
 import numpy as np
 
 
-def dh_transform(d: float, a: float, alpha: float, theta: float) -> np.ndarray:
-    ct, st, ca, sa = np.cos(theta), np.sin(theta), np.cos(alpha), np.sin(alpha)
-    return np.array([[ct, -st * ca, st * sa, a * ct],
-                     [st, ct * ca, -ct * sa, a * st],
-                     [0, sa, ca, d],
-                     [0, 0, 0, 1.0]])
-
-
 class IKError(RuntimeError):
     pass
-
-
-def _rpy(r, p, y):
-    cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
-    return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-                     [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-                     [-sp, cp * sr, cp * cr]])
 
 
 def _axis_angle(axis, q):
@@ -44,259 +28,373 @@ def _axis_angle(axis, q):
     return np.eye(3) + np.sin(q) * K + (1 - np.cos(q)) * K @ K
 
 
-def load_urdf_chain(path, base_link: str, ee_link: str, joint_names: list[str]):
-    """[(T_origin 4x4, axis 3)] for the actuated joints base_link -> ee_link, with any
-    fixed joints folded into the next origin; trailing fixed joints -> tool transform."""
-    import xml.etree.ElementTree as ET
+def _T(pos, quat_wxyz):
+    from .geometry import pose_to_matrix
 
-    root = ET.parse(path).getroot()
-    by_child = {j.find("child").get("link"): j for j in root.findall("joint")}
-    seq, link = [], ee_link
-    while link != base_link:
-        if link not in by_child:
-            raise ValueError(f"{ee_link} is not below {base_link} in {path}")
-        j = by_child[link]
-        seq.append(j)
-        link = j.find("parent").get("link")
-    seq.reverse()
-    chain, pending = [], np.eye(4)
-    for j in seq:
-        o = j.find("origin")
-        T = np.eye(4)
-        if o is not None:
-            T[:3, :3] = _rpy(*map(float, (o.get("rpy") or "0 0 0").split()))
-            T[:3, 3] = list(map(float, (o.get("xyz") or "0 0 0").split()))
-        T = pending @ T
-        if j.get("type") in ("revolute", "continuous"):
-            ax = j.find("axis")
-            axis = np.array((ax.get("xyz") if ax is not None else "1 0 0").split(), float)
-            chain.append((j.get("name"), T, axis / np.linalg.norm(axis)))
-            pending = np.eye(4)
-        else:
-            pending = T
-    names = [c[0] for c in chain]
-    if names != list(joint_names):
-        raise ValueError(f"URDF chain joints {names} != config joint_names {joint_names}")
-    return [(T, a) for _, T, a in chain], pending
+    return pose_to_matrix(pos, quat_wxyz)
+
+
+def _joint_frames(prim):
+    from pxr import UsdPhysics
+
+    j = UsdPhysics.Joint(prim)
+    q0, q1 = j.GetLocalRot0Attr().Get(), j.GetLocalRot1Attr().Get()
+    A = _T(tuple(j.GetLocalPos0Attr().Get()), (q0.GetReal(), *q0.GetImaginary()))
+    B = _T(tuple(j.GetLocalPos1Attr().Get()), (q1.GetReal(), *q1.GetImaginary()))
+    axis = {"X": (1.0, 0, 0), "Y": (0, 1.0, 0), "Z": (0, 0, 1.0)}.get(
+        str(prim.GetAttribute("physics:axis").Get() or "X"), (1.0, 0, 0))
+    b0 = [str(t) for t in j.GetBody0Rel().GetTargets()]
+    b1 = [str(t) for t in j.GetBody1Rel().GetTargets()]
+    return A, B, np.array(axis), (b0[0] if b0 else None), (b1[0] if b1 else None)
+
+
+def load_usd_chain(usd_path, joint_names, fixed_tail: dict | None = None, tool_offset=(0, 0, 0)):
+    """Returns (joints=[(T_origin, axis)], tool 4x4) in ArmModel form, rooted in the world.
+
+    Fixed joints between the world and the first controlled joint are folded into its
+    origin; `fixed_tail` joints (held at a constant angle) are folded into the tool.
+    """
+    from pxr import Usd, UsdPhysics
+
+    stage = Usd.Stage.Open(str(usd_path))
+    joints = {p.GetName(): p for p in stage.Traverse() if p.IsA(UsdPhysics.Joint)}
+    by_child = {}
+    for name, p in joints.items():
+        A, B, axis, b0, b1 = _joint_frames(p)
+        if b1:
+            by_child[b1] = (name, A, B, axis, b0, p)
+
+    # world -> body0 of the first controlled joint, via fixed joints
+    first = _joint_frames(joints[joint_names[0]])
+    prefix, body = np.eye(4), first[3]
+    while body is not None:
+        name, A, B, axis, b0, p = by_child[body]
+        if not p.IsA(UsdPhysics.FixedJoint):
+            raise ValueError(f"non-fixed joint {name} between world and {joint_names[0]}")
+        prefix = A @ np.linalg.inv(B) @ prefix
+        body = b0
+
+    out, carry, prev_child = [], prefix, first[3]
+    for name in joint_names:
+        A, B, axis, b0, b1 = _joint_frames(joints[name])
+        if b0 != prev_child:
+            raise ValueError(f"joint {name} does not continue the chain ({b0} != {prev_child})")
+        out.append((carry @ A, axis))
+        carry, prev_child = np.linalg.inv(B), b1
+    for name, angle in (fixed_tail or {}).items():
+        A, B, axis, b0, b1 = _joint_frames(joints[name])
+        if b0 != prev_child:
+            raise ValueError(f"tail joint {name} does not continue the chain")
+        R = np.eye(4)
+        R[:3, :3] = _axis_angle(axis, angle)
+        carry, prev_child = carry @ A @ R @ np.linalg.inv(B), b1
+    tool = carry.copy()
+    tool[:3, 3] = (carry @ np.array([*tool_offset, 1.0]))[:3]
+    return out, tool, prev_child
+
+
+def _hull(P):
+    """Convex hull of points -> (vertices (k,3), planes (m,4) with n.x + d <= 0 inside)."""
+    from scipy.spatial import ConvexHull
+
+    h = ConvexHull(P)
+    return P[h.vertices], h.equations
+
+
+def load_collision_hulls(usd_path, body_names) -> dict:
+    """{body: (vertices, planes)} in the world frame at the authored rest pose (q = 0).
+    PhysX collides these bodies as convex hulls (MeshCollisionAPI approximation 'convexHull'),
+    so the same hulls are what the planner checks."""
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    stage = Usd.Stage.Open(str(usd_path))
+    cache = UsdGeom.XformCache()
+    bodies = {p.GetName(): p for p in stage.Traverse() if p.HasAPI(UsdPhysics.RigidBodyAPI)}
+    out = {}
+    for name in body_names:
+        pts = []
+        for c in Usd.PrimRange(bodies[name]):
+            if c.HasAPI(UsdPhysics.CollisionAPI) and c.IsA(UsdGeom.Mesh):
+                P = np.array(UsdGeom.Mesh(c).GetPointsAttr().Get() or [])
+                if len(P):
+                    pts.append((np.c_[P, np.ones(len(P))] @ np.array(cache.GetLocalToWorldTransform(c)))[:, :3])
+        if not pts:
+            raise ValueError(f"{name} has no collision mesh")
+        out[name] = _hull(np.vstack(pts))
+    return out
+
+
+def _child_bodies(usd_path, joint_names) -> list:
+    from pxr import Usd, UsdPhysics
+
+    stage = Usd.Stage.Open(str(usd_path))
+    joints = {p.GetName(): p for p in stage.Traverse() if p.IsA(UsdPhysics.Joint)}
+    return [_joint_frames(joints[n])[4].rsplit("/", 1)[-1] for n in joint_names]
+
+
+def _move(V, H, T):
+    """Rigidly transform hull vertices and plane equations by 4x4 T."""
+    R, t = T[:3, :3], T[:3, 3]
+    n = H[:, :3] @ R.T
+    return V @ R.T + t, np.c_[n, H[:, 3] - n @ t]
+
+
+def _hull_gap(Va, Ha, Vb, Hb) -> float:
+    """Conservative signed separation of two convex hulls (m): <0 means overlap.
+    max over one hull's face planes of a vertex of the other is a lower bound on the true
+    point-to-hull distance outside and the exact depth inside; checking both ways catches
+    vertex-face contacts (edge-edge is covered by the margin)."""
+    return float(min((Va @ Hb[:, :3].T + Hb[:, 3]).max(1).min(), (Vb @ Ha[:, :3].T + Ha[:, 3]).max(1).min()))
 
 
 @dataclass
 class ArmModel:
-    joints: list            # [(T_origin 4x4, axis(3))] per actuated joint
-    tool: np.ndarray        # fixed 4x4 from last joint frame to the tool point
+    joints: list            # [(T_origin 4x4, axis(3))]
+    tool: np.ndarray        # last joint frame -> tool point
     lower: np.ndarray
     upper: np.ndarray
+    ee_body: str = ""
+    # Self-collision (left arm vs torso / right arm), all as convex hulls like PhysX:
+    obstacles: list = None  # [(name, V, H)] in the frame after joint 0 (waist): they ride on it
+    links: list = None      # [(name, frame_idx, V, H)] in the frame after joint `frame_idx` (len(joints) = tool)
+    margin: float = 0.01    # minimum accepted separation
+    path_margin: float = 0.003  # free joint-space moves may pass this close (contact is at 0)
+    influence: float = 0.025  # IK pushes the arm away (in its null space) below this separation
 
     @classmethod
-    def from_cfg(cls, robot_cfg: dict) -> "ArmModel":
-        lower = np.asarray(robot_cfg["joint_lower"], float)
-        upper = np.asarray(robot_cfg["joint_upper"], float)
-        tool_z = np.eye(4)
-        tool_z[2, 3] = float(robot_cfg.get("tool_offset_z", 0.0))
-        if robot_cfg.get("kinematics", "urdf") == "urdf":
-            from .config import project_path
+    def from_cfg(cls, cfg: dict) -> "ArmModel":
+        from . import project_path
 
-            joints, trailing = load_urdf_chain(project_path(robot_cfg["urdf_single_arm"]), robot_cfg["base_link"],
-                                               robot_cfg["ee_link"], robot_cfg["joint_names"])
-            return cls(joints, trailing @ tool_z, lower, upper)
-        return cls.from_dh(np.asarray(robot_cfg["dh"], float), lower, upper, tool_z)
+        r = cfg["robot"]
+        usd = project_path(r["usd"])
+        joints, tool, ee = load_usd_chain(usd, r["joints"], r.get("fixed_tail"), r.get("tool_offset", (0, 0, 0)))
+        if r.get("ee_body") and not ee.endswith("/" + r["ee_body"]):
+            raise ValueError(f"chain ends at {ee}, config says ee_body={r['ee_body']}")
+        arm = cls(joints, tool, np.asarray(r["lower"], float), np.asarray(r["upper"], float), ee)
+        sc = r.get("self_collision") or {}
+        if sc.get("obstacles") and sc.get("links"):
+            hulls = load_collision_hulls(usd, sc["obstacles"] + sc["links"])
+            F0 = arm.frames(np.zeros(len(joints)))
+            W = np.linalg.inv(F0[0])
+            arm.obstacles = [(n, *_move(*hulls[n], W)) for n in sc["obstacles"]]
+            idx = {b: i for i, b in enumerate(_child_bodies(usd, r["joints"]))}
+            idx[r["ee_body"]] = len(joints)
+            arm.links = []
+            for n in sc["links"]:
+                if n not in idx:
+                    raise ValueError(f"self_collision link {n} is not a body of the controlled chain")
+                arm.links.append((n, idx[n], *_move(*hulls[n], np.linalg.inv(F0[idx[n]]))))
+            arm.margin, arm.influence = float(sc.get("margin", 0.01)), float(sc.get("influence", 0.025))
+            arm.path_margin = float(sc.get("path_margin", 0.003))
+        return arm
 
-    @classmethod
-    def from_dh(cls, dh: np.ndarray, lower, upper, tool=np.eye(4)) -> "ArmModel":
-        """Standard DH [d, a, alpha, theta_offset] -> the same joint-chain form:
-        T_i = Rz(q_i + off_i) * F_i, with F_i = Tz(d) Tx(a) Rx(alpha)."""
-        joints, F_prev = [], np.eye(4)
-        for d, a, alpha, off in dh:
-            Rz = np.eye(4)
-            Rz[:3, :3] = _axis_angle((0, 0, 1), off)
-            joints.append((F_prev @ Rz, np.array([0.0, 0.0, 1.0])))
-            F_prev = dh_transform(d, a, alpha, 0.0)
-        return cls(joints, F_prev @ tool, np.asarray(lower), np.asarray(upper))
+    # ---------------------------------------------------------- self-collision
+    def frames(self, q) -> list:
+        """World pose of the frame after each joint, then the tool frame."""
+        T, R, out = np.eye(4), np.eye(4), []
+        for (T_o, axis), qi in zip(self.joints, q):
+            R[:3, :3] = _axis_angle(axis, qi)
+            T = T @ T_o @ R
+            out.append(T.copy())
+        out.append(T @ self.tool)
+        return out
+
+    def clearance(self, q) -> tuple[float, str]:
+        """Smallest separation (m, <0 = penetration) between the checked arm links and the
+        torso / right arm, and the colliding pair's name."""
+        if not self.obstacles:
+            return np.inf, ""
+        F = self.frames(q)
+        W = np.linalg.inv(F[0])
+        best, pair = np.inf, ""
+        for name, i, V, H in self.links:
+            Vl, Hl = _move(V, H, W @ F[i])
+            for oname, Vo, Ho in self.obstacles:
+                g = _hull_gap(Vl, Hl, Vo, Ho)
+                if g < best:
+                    best, pair = g, f"{name}-{oname}"
+        return best, pair
+
+    def self_collision(self, q) -> str | None:
+        """'link-body' pair closer than `margin`, else None."""
+        g, pair = self.clearance(q)
+        return pair if g < self.margin else None
+
+    def _clearance_grad(self, q, c0, h=1e-3) -> np.ndarray:
+        g = np.zeros(len(q))
+        for j in range(1, len(q)):          # the waist turns arm and torso together: no effect
+            dq = q.copy()
+            dq[j] += h
+            g[j] = (self.clearance(dq)[0] - c0) / h
+        return g
 
     # ------------------------------------------------------------------ FK
     def fk(self, q) -> np.ndarray:
-        T = np.eye(4)
-        R = np.eye(4)
+        T, R = np.eye(4), np.eye(4)
         for (T_o, axis), qi in zip(self.joints, q):
             R[:3, :3] = _axis_angle(axis, qi)
             T = T @ T_o @ R
         return T @ self.tool
 
-    # ------------------------------------------------------------------ IK
-    W_ORI = 0.1  # orientation weight (m vs rad)
-
     def _fk_jac(self, q):
-        """Tool pose + geometric Jacobian columns (world axis a_i, joint origin o_i)."""
-        T = np.eye(4)
-        R = np.eye(4)
-        axes, origins = [], []
+        T, R = np.eye(4), np.eye(4)
+        A, O = [], []
         for (T_o, axis), qi in zip(self.joints, q):
             T = T @ T_o
-            axes.append(T[:3, :3] @ axis)
-            origins.append(T[:3, 3].copy())
+            A.append(T[:3, :3] @ axis)
+            O.append(T[:3, 3].copy())
             R[:3, :3] = _axis_angle(axis, qi)
             T = T @ R
-        T = T @ self.tool
-        p, z = T[:3, 3], T[:3, 2]
-        A, O = np.array(axes), np.array(origins)
-        Jp = np.cross(A, p - O).T            # dp/dq   (3, n)
-        Jz = np.cross(A, z).T                # dz/dq   (3, n)
-        return T, Jp, Jz
+        p = (T @ self.tool)[:3, 3]
+        return p, np.cross(np.array(A), p - np.array(O)).T     # (3,), dp/dq (3,n)
 
-    def _task(self, q, p_des, z_des):
-        T, Jp, Jz = self._fk_jac(q)
-        p, z = T[:3, 3], T[:3, 2]
-        e_o = np.cross(z, z_des)             # zero when aligned (and when anti-aligned)
-        J_o = -np.cross(Jz.T, z_des).T       # d(-e_o)/dq
-        if np.dot(z, z_des) < 0:             # anti-aligned: push away from the saddle
-            kick = np.array([1.0, 0, 0])
-            e_o = e_o + 0.5 * np.cross(z, kick)
-            J_o = J_o - 0.5 * np.cross(Jz.T, kick).T
-        e = np.concatenate([p_des - p, self.W_ORI * e_o])
-        J = np.vstack([Jp, self.W_ORI * J_o])  # J = -de/dq, so dq = J^T(JJ^T+λ²)^-1 e reduces e
-        return e, J, z
-
-    def _task_error(self, q, p_des, z_des):
-        return self._task(q, p_des, z_des)[0]
-
-    def ik(self, p_des, q_seed, z_des=(0, 0, -1), tol=1e-4, max_iter=150,
-           n_restarts=8, rng: np.random.Generator | None = None) -> np.ndarray:
-        """Position + tool-axis-down IK. Raises IKError if unreachable within limits."""
-        p_des, z_des = np.asarray(p_des, float), np.asarray(z_des, float)
-        z_des = z_des / np.linalg.norm(z_des)
+    # ------------------------------------------------------------------ IK
+    def ik(self, p_des, q_seed, tol=5e-4, max_iter=150, n_restarts=6, rng=None) -> np.ndarray:
+        """Position IK. The 3 redundant DOF are used to keep the arm clear of the torso: when the
+        separation drops below `influence`, a clearance gradient step is projected into the
+        Jacobian's null space (the tool does not move), so the solution stays on the same
+        branch instead of jumping to a distant collision-free one."""
+        p_des = np.asarray(p_des, float)
         rng = rng or np.random.default_rng(0)
-        seeds = [np.asarray(q_seed, float)]
-        if n_restarts > 0:  # nearest tool-down configurations first, then random restarts
+        seeds = [np.clip(np.asarray(q_seed, float), self.lower, self.upper)]
+        if n_restarts:
             seeds += list(self._bank_seeds(p_des, k=min(4, n_restarts)))
-        seeds += [rng.uniform(self.lower * 0.9, self.upper * 0.9) for _ in range(n_restarts)]
-        best, best_err = None, np.inf
+            seeds += [rng.uniform(self.lower, self.upper) for _ in range(n_restarts)]
+        I = np.eye(len(seeds[0]))
+        best, best_d, hit = None, np.inf, None
         for q in seeds:
-            q = np.clip(q.copy(), self.lower, self.upper)
-            lam, prev = 1e-2, np.inf
+            q, lam, prev = q.copy(), 1e-2, np.inf
             for it in range(max_iter):
-                e, J, z = self._task(q, p_des, z_des)
+                p, J = self._fk_jac(q)
+                e = p_des - p
                 err = np.linalg.norm(e)
-                if err < tol:
+                c = self.clearance(q)[0] if self.obstacles else np.inf
+                clear = c >= self.margin + 0.005 or (c >= self.margin and err < tol)
+                if err < tol and clear:
                     break
-                if it > 20 and err > 0.999 * prev:   # stalled in a local minimum / at a limit
+                if it > 20 and err > 0.999 * prev and clear:
                     break
                 prev = err
-                dq = J.T @ np.linalg.solve(J @ J.T + lam ** 2 * np.eye(len(e)), e)
-                q = np.clip(q + np.clip(dq, -0.3, 0.3), self.lower, self.upper)
-            e, _, z = self._task(q, p_des, z_des)
-            pos_err = np.linalg.norm(e[:3])
-            ang_err = np.arccos(np.clip(np.dot(z, z_des), -1, 1))
-            if pos_err < 3e-3 and ang_err < np.radians(5):
-                # prefer the solution closest to the seed (smooth trajectories)
-                score = np.linalg.norm(q - seeds[0])
-                if score < best_err:
-                    best, best_err = q, score
-                if best_err < 0.5:  # close to seed: good enough, skip remaining restarts
+                Jp = J.T @ np.linalg.inv(J @ J.T + lam ** 2 * np.eye(3))
+                dq = Jp @ e
+                if c < self.influence:
+                    g = self._clearance_grad(q, c)
+                    gn = np.linalg.norm(g)
+                    if gn > 1e-9:
+                        dq = dq + (I - Jp @ J) @ (g / gn) * min(0.1, 2.0 * (self.influence - c))
+                q = np.clip(q + np.clip(dq, -0.25, 0.25), self.lower, self.upper)
+            if np.linalg.norm(p_des - self._fk_jac(q)[0]) < 3e-3:
+                col = self.self_collision(q)
+                if col:
+                    hit = hit or col
+                    continue
+                d = np.linalg.norm(q - seeds[0])
+                if d < best_d:
+                    best, best_d = q, d
+                if best_d < 0.4:
                     return best
         if best is None:
-            raise IKError(f"no IK solution for p={np.round(p_des, 3)} (tool down)")
+            raise IKError(f"{np.round(p_des, 3)} is reachable only with {hit} contact (the arm would hit the "
+                          "robot's own body)" if hit else f"{np.round(p_des, 3)} is out of reach within the joint limits")
         return best
 
-    def _bank_seeds(self, p_des, k=4, n=6000):
-        """Seeds from a lazily built bank of random configurations whose tool points
-        roughly down, ranked by distance of their tool point to p_des. Escapes the
-        local minima that DLS falls into from a single far-away seed."""
+    def _bank_seeds(self, p_des, k=4, n=4000):
         if getattr(self, "_bank", None) is None:
-            rng = np.random.default_rng(123)
-            Q = rng.uniform(self.lower, self.upper, size=(n, len(self.lower)))
-            keep_q, keep_p = [], []
-            for q in Q:
-                T = self.fk(q)
-                if T[2, 2] < -0.6:
-                    keep_q.append(q)
-                    keep_p.append(T[:3, 3])
-            object.__setattr__(self, "_bank", (np.array(keep_q), np.array(keep_p)))
-        Qb, Pb = self._bank
-        if len(Qb) == 0:
-            return []
-        idx = np.argsort(np.linalg.norm(Pb - p_des, axis=1))[:k]
-        return Qb[idx]
-
-    def _num_jac(self, q, p_des, z_des, e0, h=1e-6):
-        """Finite-difference task Jacobian (kept for testing the analytic one)."""
-        J = np.zeros((len(e0), len(q)))
-        for i in range(len(q)):
-            dq = np.zeros_like(q)
-            dq[i] = h
-            J[:, i] = -(self._task_error(q + dq, p_des, z_des) - e0) / h
-        return J
+            Q = np.random.default_rng(1).uniform(self.lower, self.upper, size=(n, len(self.lower)))
+            P = np.array([self._fk_jac(q)[0] for q in Q])
+            object.__setattr__(self, "_bank", (Q, P))
+        Q, P = self._bank
+        return Q[np.argsort(np.linalg.norm(P - p_des, axis=1))[:k]]
 
 
-# ----------------------------------------------------------------------------
-# Trajectories
 # ----------------------------------------------------------------------------
 @dataclass
-class CartesianWaypoint:
+class Waypoint:
     pos: np.ndarray
-    speed: float            # m/s to reach this waypoint from the previous one
+    speed: float
     label: str = ""
 
 
 @dataclass
 class JointTrajectory:
-    joint_names: list[str]
-    positions: np.ndarray   # (N, 6)
-    times: np.ndarray       # (N,) seconds from start, strictly increasing
-    labels: list[str]
+    q: np.ndarray           # (N, n)
+    t: np.ndarray           # (N,)
+    labels: list
+
+    def sample(self, t: float) -> np.ndarray:
+        if t <= self.t[0]:
+            return self.q[0]
+        if t >= self.t[-1]:
+            return self.q[-1]
+        i = int(np.searchsorted(self.t, t))
+        a = (t - self.t[i - 1]) / (self.t[i] - self.t[i - 1])
+        return self.q[i - 1] + a * (self.q[i] - self.q[i - 1])
 
 
-def densify(waypoints: list[CartesianWaypoint], start_pos: np.ndarray, spacing: float):
-    """Linear interpolation in Cartesian space so the joint path tracks straight
-    lines (important for pushes: a curved sweep can clip neighbouring clutter)."""
-    out, prev = [], np.asarray(start_pos, float)
-    for wp in waypoints:
-        n = max(1, int(np.ceil(np.linalg.norm(wp.pos - prev) / spacing)))
-        for k in range(1, n + 1):
-            out.append(CartesianWaypoint(prev + (wp.pos - prev) * k / n, wp.speed, wp.label))
-        prev = wp.pos
-    return out
-
-
-def plan_joint_trajectory(arm: ArmModel, joint_names: list[str], q_start: np.ndarray,
-                          waypoints: list[CartesianWaypoint], spacing: float,
-                          max_joint_vel: float, max_joint_jump: float = 0.35) -> JointTrajectory:
-    start_pos = arm.fk(q_start)[:3, 3]
-    dense = densify(waypoints, start_pos, spacing)
-    qs, ts, labels = [np.asarray(q_start, float)], [0.0], ["start"]
-    prev_p, t = start_pos, 0.0
-    for i, wp in enumerate(dense):
-        # first IK may jump (moving to approach pose); afterwards stay continuous
-        q = arm.ik(wp.pos, qs[-1], n_restarts=8 if i == 0 else 2)
-        jump = np.max(np.abs(q - qs[-1]))
-        if i > 0 and jump > max_joint_jump:
-            raise IKError(f"joint discontinuity {jump:.2f} rad at waypoint '{wp.label}' "
-                          f"(p={np.round(wp.pos, 3)}); path crosses a singularity")
-        dt = max(np.linalg.norm(wp.pos - prev_p) / max(wp.speed, 1e-3), jump / max_joint_vel, 0.02)
-        t += dt
+def plan_joint(arm: ArmModel, q_start, q_goal, max_joint_vel=1.5, step=0.05, min_z=None, label="") -> JointTrajectory:
+    """Joint-space interpolation for free moves, checked every `step` rad: the arm never gets
+    closer to its own body than min(path_margin, clearance at the start), and the tool stays above min_z."""
+    q_start, q_goal = np.asarray(q_start, float), np.asarray(q_goal, float)
+    n = max(1, int(np.ceil(np.max(np.abs(q_goal - q_start)) / step)))
+    floor_c = min(arm.path_margin, arm.clearance(q_start)[0])
+    qs, ts = [q_start], [0.0]
+    for k in range(1, n + 1):
+        q = q_start + (q_goal - q_start) * k / n
+        g, pair = arm.clearance(q)
+        if g < floor_c:
+            raise IKError(f"joint-space move to '{label}' passes {pair} at {g * 1000:.0f} mm")
+        if min_z is not None and arm.fk(q)[2, 3] < min_z:
+            raise IKError(f"joint-space move to '{label}' takes the tool below {min_z} m")
         qs.append(q)
-        ts.append(t)
-        labels.append(wp.label)
-        prev_p = wp.pos
-    return JointTrajectory(list(joint_names), np.array(qs), np.array(ts), labels)
+        ts.append(ts[-1] + max(np.max(np.abs(q - qs[-2])) / max_joint_vel, 1 / 30))
+    return JointTrajectory(np.array(qs), np.array(ts), ["start"] + [label] * n)
 
 
-if __name__ == "__main__":  # quick sanity print: python -m mybuddy_vlm.kinematics
-    import argparse
-    import sys
+def _concat(a: JointTrajectory, b: JointTrajectory) -> JointTrajectory:
+    return JointTrajectory(np.r_[a.q, b.q[1:]], np.r_[a.t, a.t[-1] + b.t[1:]], a.labels + b.labels[1:])
 
-    from .config import load_config
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=None)
-    args = ap.parse_args()
-    cfg = load_config(args.config)
-    arm = ArmModel.from_cfg(cfg["robot"])
-    np.set_printoptions(precision=4, suppress=True)
-    print("FK(zeros) flange position:", arm.fk(np.zeros(6))[:3, 3])
-    print("FK(home)  flange position:", arm.fk(cfg["robot"]["home"])[:3, 3])
-    for p in ([0.18, 0.0, 0.08], [0.22, -0.1, 0.05], [0.15, 0.12, 0.03]):
-        try:
-            q = arm.ik(p, cfg["robot"]["home"])
-            print(f"IK{p} -> q={q}  check={arm.fk(q)[:3, 3]}")
-        except IKError as e:
-            print("IK failed:", e, file=sys.stderr)
+def plan_sweep(arm: ArmModel, q_start, waypoints: list[Waypoint], spacing=0.01, max_joint_vel=1.5,
+               min_z=None, via=None) -> JointTrajectory:
+    """Free joint-space move to the first waypoint, then straight Cartesian segments through the rest.
+    The free move avoids the large reconfigurations a straight tool line from the start pose can
+    force near the torso; the contact-making segments stay Cartesian.
+    If the direct free move comes too close to the body, it goes through `via` (a known-clear
+    pose, e.g. the episode's start pose) instead."""
+    first = waypoints[0]
+    q_a = arm.ik(first.pos, q_start)
+    try:
+        free = plan_joint(arm, q_start, q_a, max_joint_vel, min_z=min_z, label=first.label)
+    except IKError:
+        if via is None:
+            raise
+        q_a = arm.ik(first.pos, via)
+        free = _concat(plan_joint(arm, q_start, via, max_joint_vel, min_z=min_z, label="via"),
+                       plan_joint(arm, via, q_a, max_joint_vel, min_z=min_z, label=first.label))
+    if len(waypoints) == 1:
+        return free
+    return _concat(free, plan_cartesian(arm, q_a, waypoints[1:], spacing, max_joint_vel, warm=True))
+
+
+def plan_cartesian(arm: ArmModel, q_start, waypoints: list[Waypoint], spacing=0.01,
+                   max_joint_vel=1.5, max_jump=0.35, warm=False) -> JointTrajectory:
+    """Straight-line Cartesian segments -> continuous, velocity-limited joint path."""
+    q = np.asarray(q_start, float)
+    p_prev = arm.fk(q)[:3, 3]
+    qs, ts, labels, t = [q], [0.0], ["start"], 0.0
+    first = not warm                      # warm: q_start already solves p_prev, check jumps from step 1
+    for wp in waypoints:
+        n = max(1, int(np.ceil(np.linalg.norm(wp.pos - p_prev) / spacing)))
+        for k in range(1, n + 1):
+            p = p_prev + (wp.pos - p_prev) * k / n
+            qn = arm.ik(p, qs[-1], n_restarts=6 if first else 1)
+            jump = float(np.max(np.abs(qn - qs[-1])))
+            if not first and jump > max_jump:
+                raise IKError(f"discontinuity {jump:.2f} rad near '{wp.label}' {np.round(p, 3)}")
+            first = False
+            t += max(np.linalg.norm(p - arm.fk(qs[-1])[:3, 3]) / wp.speed, jump / max_joint_vel, 1 / 30)
+            qs.append(qn)
+            ts.append(t)
+            labels.append(wp.label)
+        p_prev = wp.pos
+    return JointTrajectory(np.array(qs), np.array(ts), labels)
